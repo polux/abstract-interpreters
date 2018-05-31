@@ -42,6 +42,8 @@ import Debug.Trace
 import GHC.Exts (IsString(..))
 import Text.Show.Pretty (pPrint)
 
+{- Expressions -}
+
 data BinOp = Plus | Minus | Times | Div
   deriving (Eq, Ord, Show)
 
@@ -58,12 +60,9 @@ data Expr
 instance IsString Expr where
   fromString = Var
 
-data ConcreteValue = VInt Int | VClosure (Env Int) String Expr
-  deriving (Eq, Ord, Show)
+{- Values -}
 
 type Env a = M.Map String a
-type ConcreteStore = M.Map Int ConcreteValue
-type AbstractStore = M.Map String (S.Set AbstractValue)
 
 class Value m a v | v -> a where
   toInt :: Int -> m v
@@ -72,14 +71,12 @@ class Value m a v | v -> a where
   op2 :: BinOp -> v -> v -> m v
   isZero :: v -> m Bool
 
-class MonadStore m a v | v -> a where
-  find :: a -> m v
-  ext :: a -> v -> m ()
-  alloc :: String -> m a
+{-- concrete values --}
 
-asInt :: MonadError String m => ConcreteValue -> m Int
-asInt (VInt i) = return i
-asInt v = throwError (show v ++ " is not an int")
+type ConcreteEnv = Env Int
+
+data ConcreteValue = VInt Int | VClosure ConcreteEnv String Expr
+  deriving (Eq, Ord, Show)
 
 instance MonadError String m => Value m Int ConcreteValue where
   toInt i = return (VInt i)
@@ -104,20 +101,14 @@ instance MonadError String m => Value m Int ConcreteValue where
     vi <- asInt v
     return (vi == 0)
 
-instance (MonadError String m, MonadState ConcreteStore m) => MonadStore m Int ConcreteValue where
-  find a = do
-    maybeVal <- gets (M.lookup a)
-    case maybeVal of
-      Just v -> return v
-      Nothing -> throwError ("unknown address " ++ show a)
+{-- abstract values --}
 
-  ext a v = modify (M.insert a v)
-
-  alloc _ = gets M.size
+type AbstractEnv = Env String
 
 data AbstractInt = SomeInt | ExactInt Int
   deriving (Eq, Ord, Show)
-data AbstractValue = AInt AbstractInt | AClosure (Env String) String Expr
+
+data AbstractValue = AInt AbstractInt | AClosure AbstractEnv String Expr
   deriving (Eq, Ord, Show)
 
 instance (MonadError String m, MonadPlus m) => Value m String AbstractValue where
@@ -141,6 +132,36 @@ instance (MonadError String m, MonadPlus m) => Value m String AbstractValue wher
   isZero (AInt SomeInt) = return True `mplus` return False
   isZero x = throwError ("type error isZero: " ++ show x)
 
+{- Stores -}
+
+class MonadStore m a v | v -> a where
+  find :: a -> m v
+  ext :: a -> v -> m ()
+  alloc :: String -> m a
+
+{-- concrete stores --}
+
+type ConcreteStore = M.Map Int ConcreteValue
+
+asInt :: MonadError String m => ConcreteValue -> m Int
+asInt (VInt i) = return i
+asInt v = throwError (show v ++ " is not an int")
+
+instance (MonadError String m, MonadState ConcreteStore m) => MonadStore m Int ConcreteValue where
+  find a = do
+    maybeVal <- gets (M.lookup a)
+    case maybeVal of
+      Just v -> return v
+      Nothing -> throwError ("unknown address " ++ show a)
+
+  ext a v = modify (M.insert a v)
+
+  alloc _ = gets M.size
+
+{-- abstract stores --}
+
+type AbstractStore = M.Map String (S.Set AbstractValue)
+
 instance ( MonadError String m
          , MonadState AbstractStore m
          , MonadPlus m
@@ -155,6 +176,8 @@ instance ( MonadError String m
   ext a v = modify (M.insertWith S.union a (S.singleton v))
 
   alloc x = return x
+
+{- Interpreter -}
 
 ev
   :: forall m a v
@@ -196,12 +219,41 @@ ev ev e = ev' e
     ext addr ev
     return ev
 
+{- Concrete semantics -}
+
+eval :: Expr -> (Either String ConcreteValue, ConcreteStore)
+eval e =
+  runIdentity
+    $ flip runStateT M.empty    -- store
+    $ runExceptT                -- errors
+    $ flip runReaderT M.empty   -- environment
+    $ fix ev e
+
+{- Trace semantics -}
+
 evTell ev0 ev e = do
   v <- ev0 ev e
   env <- ask
   store <- get
   tell [(env, store, e, v)]
   return v
+
+type ConcreteMachineState = (Env Int, ConcreteStore, Expr, ConcreteValue)
+
+evalCollect
+  :: Expr
+  -> ((Either String ConcreteValue, ConcreteStore), [ConcreteMachineState])
+evalCollect e =
+  runIdentity
+    $ runWriterT               -- collected states
+    $ flip runStateT M.empty   -- store
+    $ runExceptT               -- errors
+    $ flip runReaderT M.empty  -- environment
+    $ fix (evTell ev) e
+
+{- Abstract semantics -}
+
+{-- cache --}
 
 type Configuration = (Expr, Env String, AbstractStore)
 type ValueAndStore = (AbstractValue, AbstractStore)
@@ -221,7 +273,7 @@ modifyCacheOut f = do
   putCacheOut (f cache)
 
 evCache
-  :: ( MonadReader (Env String) m
+  :: ( MonadReader AbstractEnv m
      , MonadState AbstractStore m
      , MonadCache m
      , MonadPlus m
@@ -250,7 +302,7 @@ evCache ev0 ev e = do
       return v
 
 fixCache
-  :: ( MonadReader (Env String) m
+  :: ( MonadReader AbstractEnv m
      , MonadState AbstractStore m
      , MonadCache m
      , MonadPlus m
@@ -282,29 +334,10 @@ mlfp bot f = loop bot
     x' <- f x
     if x == x' then return x else loop x'
 
-eval :: Expr -> (Either String ConcreteValue, ConcreteStore)
-eval e =
-  runIdentity
-    $ flip runStateT M.empty    -- store
-    $ runExceptT                -- errors
-    $ flip runReaderT M.empty   -- environment
-    $ fix ev e
-
-type ConcreteMachineState = (Env Int, ConcreteStore, Expr, ConcreteValue)
-
-evalCollect
-  :: Expr
-  -> ((Either String ConcreteValue, ConcreteStore), [ConcreteMachineState])
-evalCollect e =
-  runIdentity
-    $ runWriterT               -- collected states
-    $ flip runStateT M.empty   -- store
-    $ runExceptT               -- errors
-    $ flip runReaderT M.empty  -- environment
-    $ fix (evTell ev) e
+{-- abstract monad stack --}
 
 type AbstractStack =
-  ReaderT (Env String)
+  ReaderT AbstractEnv
     (ExceptT String
       (StateT AbstractStore
         (ListT
@@ -316,7 +349,7 @@ newtype Abstract a = Abstract { runAbstract :: AbstractStack a }
     ( Functor
     , Applicative
     , Monad
-    , MonadReader (Env String)
+    , MonadReader AbstractEnv
     , MonadState AbstractStore
     , MonadError String)
 
@@ -361,6 +394,8 @@ evalAbstract e =
     $ runAbstract
     $ fixCache (fix (evCache ev)) e
 
+{- Example -}
+
 a *: b = Op2 Times a b
 a -: b = Op2 Minus a b
 a +: b = Op2 Plus a b
@@ -380,4 +415,12 @@ test = letIn
     (Lit 4)
   )
 
-main = pPrint $ S.fromList $ fst $ evalAbstract test
+main = do
+  printHeader "-- CONCRETE --"
+  pPrint $ eval test
+  printHeader "-- CONCRETE TRACE --"
+  pPrint $ evalCollect test
+  printHeader "-- ABSTRACT --"
+  pPrint $ S.fromList $ fst $ evalAbstract test
+
+  where printHeader s = putStrLn ("\n" ++ s ++ "\n")
