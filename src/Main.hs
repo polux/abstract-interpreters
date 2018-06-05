@@ -24,6 +24,7 @@
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE PartialTypeSignatures #-}
+{-# LANGUAGE PatternSynonyms #-}
 
 import Control.Applicative
 import Control.Monad.Except
@@ -41,33 +42,77 @@ import Data.Traversable
 import Debug.Trace
 import GHC.Exts (IsString(..))
 import Text.Show.Pretty (pPrint)
-
-{- Expressions -}
+import Data.Functor.Compose
+import Data.Functor.Classes
+import Data.List (intercalate)
 
 data BinOp = Plus | Minus | Times | Div
   deriving (Eq, Ord, Show)
 
-data Expr
-  = Var String
-  | App Expr Expr
-  | Lam String Expr
-  | Rec String Expr
-  | IfZero Expr Expr Expr
+data Expr n {- name -} l {- label -}
+  = Var n
+  | App l (Expr n l) (Expr n l)
+  | Lam n (Expr n l)
+  | Rec n (Expr n l)
+  | IfZero (Expr n l) (Expr n l) (Expr n l)
   | Lit Int
-  | Op2 BinOp Expr Expr
-  deriving (Eq, Ord, Show)
+  | Op2 BinOp (Expr n l) (Expr n l)
+  deriving (Eq, Ord)
 
-instance IsString Expr where
-  fromString = Var
+type Label = Int
+data Name = Name Label String
+  deriving (Eq, Ord)
+
+type UExpr = Expr String ()
+type LExpr = Expr Name Label
+
+label :: UExpr -> LExpr
+label e = fst $ runIdentity (runReaderT (runStateT (label' e) 0) M.empty)
+ where
+  freshLabel = do { l <- get; put (l+1); return l }
+  freshName x = Name <$> freshLabel <*> pure x
+
+  label' (Var x) = Var <$> asks (M.! x)
+  label' (App () e1 e2) = App <$> freshLabel <*> label' e1 <*> label' e2
+  label' (Lam x e) = do
+    name <- freshName x
+    Lam name <$> local (M.insert x name) (label' e)
+  label' (Rec x e) = do
+    name <- freshName x
+    Rec name <$> local (M.insert x name) (label' e)
+  label' (IfZero e1 e2 e3) = IfZero <$> label' e1 <*> label' e2 <*> label' e3
+  label' (Lit i) = return $ Lit i
+  label' (Op2 op e1 e2) = Op2 op <$> label' e1 <*> label' e2
+
+{- Pretty-printing -}
+
+instance Show Name where
+  show (Name l x) = show l ++ ":" ++ x
+
+pretty :: LExpr -> String
+pretty (Var x) = show x
+pretty (App l t1 t2) = show l ++ ":(" ++ pretty t1 ++ " " ++ pretty t2 ++ ")"
+pretty (Lam x t) = "(" ++ show x ++ " -> " ++ pretty t ++ ")"
+pretty (Rec x t) = "(fix (" ++ show x ++ " -> " ++ pretty t ++ "))"
+pretty (IfZero a b c) = "(ifZero " ++ pretty a ++ " then " ++ pretty b ++ " else " ++ pretty c ++ ")"
+pretty (Lit i) = show i
+pretty (Op2 op e1 e2) = "(" ++ pretty e1 ++ pop op ++ pretty e2 ++ ")"
+  where pop Plus = " + "
+        pop Minus = " - "
+        pop Times = " * "
+        pop Div = " / "
+
+instance Show LExpr where
+  show e = "\"" ++ pretty e ++ "\""
 
 {- Values -}
 
-type Env a = M.Map String a
+type Env a = M.Map Name a
 
 class Value m a v | v -> a where
   toInt :: Int -> m v
-  asClosure :: v -> m (Env a, String, Expr)
-  toClosure :: Env a -> String -> Expr -> m v
+  asClosure :: v -> m (Env a, Name, LExpr)
+  toClosure :: Env a -> Name -> LExpr -> m v
   op2 :: BinOp -> v -> v -> m v
   isZero :: v -> m Bool
 
@@ -75,7 +120,7 @@ class Value m a v | v -> a where
 
 type ConcreteEnv = Env Int
 
-data ConcreteValue = VInt Int | VClosure ConcreteEnv String Expr
+data ConcreteValue = VInt Int | VClosure ConcreteEnv Name LExpr
   deriving (Eq, Ord, Show)
 
 instance MonadError String m => Value m Int ConcreteValue where
@@ -103,15 +148,15 @@ instance MonadError String m => Value m Int ConcreteValue where
 
 {-- abstract values --}
 
-type AbstractEnv = Env String
+type AbstractEnv = Env History
 
 data AbstractInt = SomeInt | ExactInt Int
   deriving (Eq, Ord, Show)
 
-data AbstractValue = AInt AbstractInt | AClosure AbstractEnv String Expr
+data AbstractValue = AInt AbstractInt | AClosure AbstractEnv Name LExpr
   deriving (Eq, Ord, Show)
 
-instance (MonadError String m, MonadPlus m) => Value m String AbstractValue where
+instance (MonadError String m, MonadPlus m) => Value m History AbstractValue where
   toInt i = return (AInt (ExactInt i))
 
   asClosure (AClosure env x e) = return (env, x, e)
@@ -119,13 +164,19 @@ instance (MonadError String m, MonadPlus m) => Value m String AbstractValue wher
 
   toClosure env x e = return (AClosure env x e)
 
+  op2 Plus (AInt (ExactInt i)) (AInt (ExactInt j)) = return (AInt (ExactInt (i+j)))
   op2 Plus (AInt _) (AInt _) = return (AInt SomeInt)
+
+  op2 Minus (AInt (ExactInt i)) (AInt (ExactInt j)) = return (AInt (ExactInt (i-j)))
   op2 Minus (AInt _) (AInt _) = return (AInt SomeInt)
+
+  op2 Times (AInt (ExactInt i)) (AInt (ExactInt j)) = return (AInt (ExactInt (i*j)))
   op2 Times (AInt _) (AInt _) = return (AInt SomeInt)
-  op2 Div (AInt _) (AInt ai)
-    | ExactInt 0 <- ai = throwError "division by zero"
-    | ExactInt _ <- ai = return (AInt SomeInt)
-    | otherwise = throwError "division by zero" `mplus` return (AInt SomeInt)
+
+  op2 Div (AInt _) (AInt (ExactInt 0)) = throwError "division by zero"
+  op2 Div (AInt (ExactInt i)) (AInt (ExactInt j)) = return (AInt (ExactInt (i `div` j)))
+  op2 Div (AInt _) (AInt _) = throwError "division by zero" `mplus` return (AInt SomeInt)
+
   op2 op a b = throwError ("type error " ++ show (op, a, b))
 
   isZero (AInt (ExactInt n)) = return (n == 0)
@@ -137,7 +188,7 @@ instance (MonadError String m, MonadPlus m) => Value m String AbstractValue wher
 class MonadStore m a v | v -> a where
   find :: a -> m v
   ext :: a -> v -> m ()
-  alloc :: String -> m a
+  alloc :: Label -> m a
 
 {-- concrete stores --}
 
@@ -160,22 +211,33 @@ instance (MonadError String m, MonadState ConcreteStore m) => MonadStore m Int C
 
 {-- abstract stores --}
 
-type AbstractStore = M.Map String (S.Set AbstractValue)
+newtype History = History [Label]
+  deriving (Eq, Ord)
 
-instance ( MonadError String m
-         , MonadState AbstractStore m
-         , MonadPlus m
-         )
-      => MonadStore m String AbstractValue where
+instance Show History where
+  show (History xs) = "\"@" ++ intercalate "," (map show xs) ++ "\""
+
+type AbstractStore = M.Map History (S.Set AbstractValue)
+
+instance MonadStore Abstract History AbstractValue where
   find a = do
     maybeVals <- gets (M.lookup a)
     case maybeVals of
       Just vals -> msum (map return (S.toList vals))
       Nothing -> throwError ("unknown address " ++ show a)
 
-  ext a v = modify (M.insertWith S.union a (S.singleton v))
+  ext a v = do
+    maybeVals <- gets (M.lookup a)
+    let newVals = case maybeVals of
+          Nothing -> S.singleton v
+          Just vs -> S.insert (AInt SomeInt) (S.filter isAClosure vs)
+    modify (M.insert a newVals)
+   where
+    isAClosure (AClosure _ _ _) = True
+    isAClosure _ = False
 
-  alloc x = return x
+  alloc l = Abstract . lift $ asks (cons l)
+    where cons l (History ls) = History (l:ls)
 
 {- Interpreter -}
 
@@ -186,12 +248,11 @@ ev
      , MonadStore m a v
      , Value m a v
      )
-  => (Expr -> m v)
-  -> Expr
+  => (LExpr -> m v)
+  -> LExpr
   -> m v
 ev ev e = ev' e
  where
-  ev' :: Expr -> m v
   ev' (Lit i) = toInt i
   ev' (Op2 op a b) = do
     av <- ev a
@@ -206,22 +267,22 @@ ev ev e = ev' e
   ev' (Lam x e) = do
     env <- ask
     toClosure env x e
-  ev' (App a b) = do
-    (env, x, e) <- ev a >>= asClosure @m @a @v
+  ev' (App _ a b) = do
+    (env, x@(Name l _), e) <- ev a >>= asClosure @m @a @v
     bv <- ev b
-    addr <- alloc @m @a @v x
+    addr <- alloc @m @a @v l
     ext addr bv
     local (const (M.insert x addr env)) (ev e)
-  ev' (Rec f e) = do
+  ev' (Rec f@(Name l _) e) = do
     env <- ask
-    addr <- alloc @m @a @v f
+    addr <- alloc @m @a @v l
     ev <- local (M.insert f addr) (ev e)
     ext addr ev
     return ev
 
 {- Concrete semantics -}
 
-eval :: Expr -> (Either String ConcreteValue, ConcreteStore)
+eval :: LExpr -> (Either String ConcreteValue, ConcreteStore)
 eval e =
   runIdentity
     $ flip runStateT M.empty    -- store
@@ -238,10 +299,10 @@ evTell ev0 ev e = do
   tell [(env, store, e, v)]
   return v
 
-type ConcreteMachineState = (Env Int, ConcreteStore, Expr, ConcreteValue)
+type ConcreteMachineState = (Env Int, ConcreteStore, LExpr, ConcreteValue)
 
 evalCollect
-  :: Expr
+  :: LExpr
   -> ((Either String ConcreteValue, ConcreteStore), [ConcreteMachineState])
 evalCollect e =
   runIdentity
@@ -253,9 +314,28 @@ evalCollect e =
 
 {- Abstract semantics -}
 
+{-- history --}
+
+class MonadHistory m where
+  localHistory :: (History -> History) -> m a -> m a
+
+evHistory
+  :: MonadHistory m
+  => Int
+  -> ((LExpr -> m mValue) -> LExpr -> m mValue)
+  -> (LExpr -> m mValue)
+  -> LExpr
+  -> m mValue
+evHistory limit ev0 ev e
+  | App l _ _ <- e = localHistory (extendHistory l) (ev0 ev e)
+  | otherwise = ev0 ev e
+ where
+  extendHistory x (History xs) | length xs <= limit = History (x : xs)
+                               | otherwise = History xs
+
 {-- cache --}
 
-type Configuration = (Expr, Env String, AbstractStore)
+type Configuration = (LExpr, AbstractEnv, AbstractStore)
 type ValueAndStore = (AbstractValue, AbstractStore)
 type Cache = M.Map Configuration (S.Set ValueAndStore)
 
@@ -278,9 +358,9 @@ evCache
      , MonadCache m
      , MonadPlus m
      )
-  => ((Expr -> m AbstractValue) -> Expr -> m AbstractValue)
-  -> (Expr -> m AbstractValue)
-  -> Expr
+  => ((LExpr -> m AbstractValue) -> LExpr -> m AbstractValue)
+  -> (LExpr -> m AbstractValue)
+  -> LExpr
   -> m AbstractValue
 evCache ev0 ev e = do
   env <- ask
@@ -307,8 +387,8 @@ fixCache
      , MonadCache m
      , MonadPlus m
      )
-  => (Expr -> m AbstractValue)
-  -> Expr
+  => (LExpr -> m AbstractValue)
+  -> LExpr
   -> m AbstractValue
 fixCache ev e = do
   env <- ask
@@ -338,11 +418,12 @@ mlfp bot f = loop bot
 
 type AbstractStack =
   ReaderT AbstractEnv
-    (ExceptT String
-      (StateT AbstractStore
-        (ListT
-          (ReaderT Cache
-            (StateT Cache Identity)))))
+    (ReaderT History
+      (ExceptT String
+        (StateT AbstractStore
+          (ListT
+            (ReaderT Cache
+              (StateT Cache Identity))))))
 
 newtype Abstract a = Abstract { runAbstract :: AbstractStack a }
   deriving
@@ -382,45 +463,52 @@ instance MonadCache Abstract where
   getCacheOut = Abstract . lift . lift . lift . lift . lift $ get
   putCacheOut c = Abstract . lift . lift . lift . lift . lift $ put c
 
-evalAbstract :: Expr -> ([(Either String AbstractValue, AbstractStore)], Cache)
-evalAbstract e =
+instance MonadHistory Abstract where
+  localHistory f a =
+    Abstract $ liftControl $ \run -> local f (run (runAbstract a))
+
+evalAbstract :: Int -> LExpr -> ([(Either String AbstractValue, AbstractStore)], Cache)
+evalAbstract limit e =
   runIdentity
     $ flip runStateT M.empty   -- cache-out
     $ flip runReaderT M.empty  -- cache-in
     $ runListT                 -- non-determinism
     $ flip runStateT M.empty   -- store
     $ runExceptT               -- errors
+    $ flip runReaderT (History [])  -- history
     $ flip runReaderT M.empty  -- environment
     $ runAbstract
-    $ fixCache (fix (evCache ev)) e
+    $ fixCache (fix (evCache (evHistory limit ev))) e
 
 {- Example -}
 
+instance IsString UExpr where
+  fromString = Var
+
+a @: b = App () a b
 a *: b = Op2 Times a b
 a -: b = Op2 Minus a b
 a +: b = Op2 Plus a b
 a /: b = Op2 Div a b
 
-letIn x e1 e2 = App (Lam x e2) e1
+letIn x e1 e2 = Lam x e2 @: e1
 
-fact = Rec
-  "fact"
-  (Lam "n" (IfZero "n" (Lit 1) ("n" *: ("fact" `App` ("n" -: Lit 1)))))
+fact =
+  Rec "fact" (Lam "n" (IfZero "n" (Lit 1) ("n" *: ("fact" @: ("n" -: Lit 1)))))
 
-test = letIn
-  "f"
-  fact
-  (App
-    (Lam "x" (IfZero (Var "x") (Lit 1 /: Var "x") (App (Var "f") (Var "x"))))
-    (Lit 4)
-  )
+test =
+  letIn "f" fact
+  (Lam "x" (IfZero "x" (Lit 1 /: "x") ("f" @: "x")) @: Lit 4)
 
 main = do
   printHeader "-- CONCRETE --"
-  pPrint $ eval test
+  pPrint $ eval ltest
   printHeader "-- CONCRETE TRACE --"
-  pPrint $ evalCollect test
-  printHeader "-- ABSTRACT --"
-  pPrint $ S.fromList $ fst $ evalAbstract test
+  pPrint $ evalCollect ltest
+  printHeader "-- ABSTRACT 3 --"
+  pPrint $ S.fromList $ fst $ evalAbstract 3 ltest
+  printHeader "-- ABSTRACT 15 --"
+  pPrint $ S.fromList $ fst $ evalAbstract 15 ltest
 
   where printHeader s = putStrLn ("\n" ++ s ++ "\n")
+        ltest = label test
