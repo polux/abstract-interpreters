@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-resolver: lts-11.11
+resolver: nightly-2018-06-07
 packages:
 - .
 extra-deps: []
