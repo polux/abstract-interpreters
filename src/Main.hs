@@ -45,6 +45,7 @@ import Text.Show.Pretty (pPrint)
 import Data.Functor.Compose
 import Data.Functor.Classes
 import Data.List (intercalate)
+import Data.Function
 
 data BinOp = Plus | Minus | Times | Div
   deriving (Eq, Ord, Show)
@@ -87,7 +88,7 @@ label e = fst $ runIdentity (runReaderT (runStateT (label' e) 0) M.empty)
 {- Pretty-printing -}
 
 instance Show Name where
-  show (Name l x) = show l ++ ":" ++ x
+  show (Name l x) = x ++ "_" ++ show l
 
 pretty :: LExpr -> String
 pretty (Var x) = show x
@@ -305,12 +306,12 @@ evalCollect
   :: LExpr
   -> ((Either String ConcreteValue, ConcreteStore), [ConcreteMachineState])
 evalCollect e =
-  runIdentity
-    $ runWriterT               -- collected states
-    $ flip runStateT M.empty   -- store
-    $ runExceptT               -- errors
-    $ flip runReaderT M.empty  -- environment
-    $ fix (evTell ev) e
+  fix (evTell ev) e
+    & flip runReaderT M.empty  -- environment
+    & runExceptT               -- errors
+    & flip runStateT M.empty   -- store
+    & runWriterT               -- collected states
+    & runIdentity
 
 {- Abstract semantics -}
 
@@ -469,16 +470,16 @@ instance MonadHistory Abstract where
 
 evalAbstract :: Int -> LExpr -> ([(Either String AbstractValue, AbstractStore)], Cache)
 evalAbstract limit e =
-  runIdentity
-    $ flip runStateT M.empty   -- cache-out
-    $ flip runReaderT M.empty  -- cache-in
-    $ runListT                 -- non-determinism
-    $ flip runStateT M.empty   -- store
-    $ runExceptT               -- errors
-    $ flip runReaderT (History [])  -- history
-    $ flip runReaderT M.empty  -- environment
-    $ runAbstract
-    $ fixCache (fix (evCache (evHistory limit ev))) e
+  fixCache (fix (evCache (evHistory limit ev))) e
+    & runAbstract
+    & flip runReaderT M.empty      -- environment
+    & flip runReaderT (History []) -- history
+    & runExceptT                   -- errors
+    & flip runStateT M.empty       -- store
+    & runListT                     -- non-determinism
+    & flip runReaderT M.empty      -- cache-in
+    & flip runStateT M.empty       -- cache-out
+    & runIdentity
 
 {- Example -}
 
@@ -507,8 +508,8 @@ main = do
   pPrint $ evalCollect ltest
   printHeader "-- ABSTRACT 3 --"
   pPrint $ S.fromList $ fst $ evalAbstract 3 ltest
-  printHeader "-- ABSTRACT 15 --"
-  pPrint $ S.fromList $ fst $ evalAbstract 15 ltest
+  printHeader "-- ABSTRACT 6 --"
+  pPrint $ S.fromList $ fst $ evalAbstract 6 ltest
 
   where printHeader s = putStrLn ("\n" ++ s ++ "\n")
         ltest = label test
