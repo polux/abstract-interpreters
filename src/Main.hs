@@ -25,6 +25,11 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE PartialTypeSignatures #-}
 {-# LANGUAGE PatternSynonyms #-}
+{-# LANGUAGE TypeApplications #-}
+
+import qualified Control.Effect as E
+import qualified Control.Effect.Reader as E
+import qualified Control.Effect.State as E
 
 import Control.Applicative
 import Control.Monad.Except
@@ -68,19 +73,19 @@ type UExpr = Expr String ()
 type LExpr = Expr Name Label
 
 label :: UExpr -> LExpr
-label e = fst $ runIdentity (runReaderT (runStateT (label' e) 0) M.empty)
+label e = E.run $ E.runReader (M.empty :: M.Map String Name) $ E.evalState (0::Label) (label' e)
  where
-  freshLabel = do { l <- get; put (l+1); return l }
+  freshLabel = do { l <- E.get; E.put (l+1); return l }
   freshName x = Name <$> freshLabel <*> pure x
 
-  label' (Var x) = Var <$> asks (M.! x)
+  label' (Var x) = Var <$> E.asks (M.! x)
   label' (App () e1 e2) = App <$> freshLabel <*> label' e1 <*> label' e2
   label' (Lam x e) = do
     name <- freshName x
-    Lam name <$> local (M.insert x name) (label' e)
+    Lam name <$> E.local (M.insert x name) (label' e)
   label' (Rec x e) = do
     name <- freshName x
-    Rec name <$> local (M.insert x name) (label' e)
+    Rec name <$> E.local (M.insert x name) (label' e)
   label' (IfZero e1 e2 e3) = IfZero <$> label' e1 <*> label' e2 <*> label' e3
   label' (Lit i) = return $ Lit i
   label' (Op2 op e1 e2) = Op2 op <$> label' e1 <*> label' e2

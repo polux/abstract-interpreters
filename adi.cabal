@@ -26,4 +26,5 @@ executable adi
                        mtl,
                        logict,
                        pretty-show,
-                       monad-control
+                       monad-control,
+                       fused-effects
