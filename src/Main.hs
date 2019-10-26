@@ -616,7 +616,7 @@ evalAbstract ::
     ]
   )
 evalAbstract limit e =
-  fixCache (fix (evCache (evHistory limit (evGc @_ @_ @History @_ @(S.Set AbstractValue) (evTell @_ @_ @History @_ @(S.Set AbstractValue) ev))))) e
+  eval e
     & runReader (M.empty :: AbstractEnv) -- environment
     & runReader (S.empty :: Roots History) -- garbage collection roots
     & runReader (History []) -- history
@@ -627,6 +627,14 @@ evalAbstract limit e =
     & runReader (M.empty :: Cache) -- cache-in
     & runState (M.empty :: Cache) -- cache-out
     & run
+  where
+    eval =
+      ev
+        & evTell @_ @_ @History @_ @(S.Set AbstractValue)
+        & evHistory limit
+        & evCache
+        & fix
+        & fixCache
 
 {- Example -}
 
