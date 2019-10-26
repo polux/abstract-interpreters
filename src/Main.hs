@@ -255,9 +255,11 @@ instance (E.Member (E.Error String) sig, E.Member (E.Reader History) sig, E.Memb
 
 type Roots a = S.Set a
 
-class MonadGarbage m a where
-  askRoots :: m (Roots a)
-  extraRoots :: Roots a -> m b -> m b
+askRoots :: (E.Member (E.Reader (Roots a)) sig, E.Carrier sig m) => m (Roots a)
+askRoots = E.ask
+
+extraRoots :: (E.Member (E.Reader (Roots a)) sig, Ord a, E.Carrier sig m) => Roots a -> m b -> m b
+extraRoots roots = E.local (roots `S.union`)
 
 fv :: Ord n => Expr n l -> S.Set n
 fv (Lit _) = S.empty
@@ -294,7 +296,7 @@ gc addresses store = store `M.restrictKeys` reachable addresses addresses
 
 evGc
   :: forall sig m a v av.
-     ( MonadGarbage m a
+     ( E.Member (E.Reader (Roots a)) sig
      , E.Member (E.State (Store a av)) sig
      , Ord a
      , HasRoots v a
@@ -306,7 +308,7 @@ evGc
   -> LExpr
   -> m v
 evGc ev0 ev e = do
-  rs <- askRoots @m @a
+  rs <- askRoots
   v <- ev0 ev e
   E.modify @(Store a av) (gc (S.union rs (roots v)))
   return v
@@ -317,8 +319,8 @@ ev
   :: forall sig m a v
    . ( E.Member (E.Error String) sig
      , E.Member (E.Reader (Env a)) sig
+     , E.Member (E.Reader (Roots a)) sig
      , MonadStore m a v
-     , MonadGarbage m a
      , Value m a v
      , HasRoots v a
      , Ord a
@@ -365,10 +367,6 @@ ev ev e = ev' e
 
 {- Concrete semantics -}
 
-instance (E.Member (E.Reader (Roots Int)) sig, E.Carrier sig m) => MonadGarbage m Int where
-  askRoots = E.ask
-  extraRoots roots = E.local (roots `S.union`)
-
 eval :: LExpr -> (ConcreteStore, Either String ConcreteValue)
 eval e =
   fix (evGc @_ @_ @Int @_ @ConcreteValue ev) e
@@ -382,7 +380,7 @@ eval e =
 
 evTell
   :: forall sig m a v av.
-     ( MonadGarbage m a
+     ( E.Member (E.Reader (Roots a)) sig
      , E.Member (E.State (Store a av)) sig
      , E.Member (E.Reader (Env a)) sig
      , E.Member (E.Writer [MachineState a v av]) sig
@@ -417,7 +415,6 @@ evalCollect
   -> ([ConcreteMachineState], (ConcreteStore, Either String ConcreteValue))
 evalCollect e =
   fix (evGc @_ @_ @Int @_ @ConcreteValue (evTell @_ @_ @Int @_ @ConcreteValue ev)) e
-  --fix (evTell @_ @_ @Int @_ @ConcreteValue ev) e
     & E.runReader (M.empty :: ConcreteEnv)  -- environment
     & E.runReader (S.empty :: Roots Int) -- garbage collection roots
     & E.runError           -- error
@@ -429,11 +426,11 @@ evalCollect e =
 
 {-- history --}
 
-class MonadHistory m where
-  localHistory :: (History -> History) -> m a -> m a
+localHistory :: (E.Member (E.Reader History) sig, E.Carrier sig m) => (History -> History) -> m a -> m a
+localHistory = E.local @History
 
 evHistory
-  :: MonadHistory m
+  :: (E.Member (E.Reader History) sig, E.Carrier sig m)
   => Int
   -> ((LExpr -> m v) -> LExpr -> m v)
   -> (LExpr -> m v)
@@ -452,75 +449,82 @@ type Configuration = (LExpr, AbstractEnv, Roots History, AbstractStore)
 type ValueAndStore = (AbstractValue, AbstractStore)
 type Cache = M.Map Configuration (S.Set ValueAndStore)
 
--- We need to define a custom class because there can only be one instance of
--- MonadReader and MonadState per monad and those are already used by the env
--- and the store.
-class MonadCache m where
-  getCacheIn :: m Cache
-  withLocalCacheIn :: Cache -> m a -> m a
-  getCacheOut :: m Cache
-  putCacheOut :: Cache -> m ()
+getCacheIn :: (E.Member (E.Reader Cache) sig, E.Carrier sig m) => m Cache
+getCacheIn = E.ask
+
+withLocalCacheIn :: (E.Member (E.Reader Cache) sig, E.Carrier sig m) => Cache -> m a -> m a
+withLocalCacheIn cache = E.local (const cache)
+
+getCacheOut :: (E.Member (E.State Cache) sig, E.Carrier sig m) => m Cache
+getCacheOut = E.get
+
+putCacheOut :: (E.Member (E.State Cache) sig, E.Carrier sig m) => Cache -> m ()
+putCacheOut = E.put
 
 modifyCacheOut f = do
   cache <- getCacheOut
   putCacheOut (f cache)
 
 evCache
-  :: ( MonadReader AbstractEnv m
-     , MonadState AbstractStore m
-     , MonadGarbage m History
-     , MonadCache m
-     , MonadPlus m
+  :: ( E.Member (E.Reader AbstractEnv) sig
+     , E.Member (E.State AbstractStore) sig
+     , E.Member (E.Reader (Roots History)) sig
+     , E.Member (E.Reader Cache) sig
+     , E.Member (E.State Cache) sig
+     , E.Carrier sig m
+     , Alternative m
      )
   => ((LExpr -> m AbstractValue) -> LExpr -> m AbstractValue)
   -> (LExpr -> m AbstractValue)
   -> LExpr
   -> m AbstractValue
 evCache ev0 ev e = do
-  env <- ask
+  env <- E.ask
   roots <- askRoots
-  store <- get
+  store <- E.get
   let config = (e, env, roots, store)
   cacheOut <- getCacheOut
   case M.lookup config cacheOut of
     Just entries -> do
-      (configIn, storeIn) <- msum (map return (S.toList entries))
-      put storeIn
+      (configIn, storeIn) <- asum (map return (S.toList entries))
+      E.put storeIn
       return configIn
     Nothing -> do
       cacheIn <- getCacheIn
       let entries = fromMaybe S.empty (M.lookup config cacheIn)
       putCacheOut (M.insertWith S.union config entries cacheOut)
       v <- ev0 ev e
-      store' <- get
+      store' <- E.get
       modifyCacheOut (M.insertWith S.union config (S.singleton (v, store')))
       return v
 
 fixCache
-  :: ( MonadReader AbstractEnv m
-     , MonadState AbstractStore m
-     , MonadGarbage m History
-     , MonadCache m
-     , MonadPlus m
+  :: ( E.Member (E.Reader AbstractEnv) sig
+     , E.Member (E.State AbstractStore) sig
+     , E.Member (E.Reader (Roots History)) sig
+     , E.Member (E.Reader Cache) sig
+     , E.Member (E.State Cache) sig
+     , E.Carrier sig m
+     , Alternative m
      )
   => (LExpr -> m AbstractValue)
   -> LExpr
   -> m AbstractValue
 fixCache ev e = do
-  env <- ask
+  env <- E.ask
   roots <- askRoots
-  store <- get
+  store <- E.get
   let config = (e, env, roots, store)
   cachePlus <- mlfp M.empty $ \cache -> do
     putCacheOut M.empty
-    put store
+    E.put store
     withLocalCacheIn cache (ev e)
     getCacheOut
   let entries = cachePlus M.! config
-  msum
+  asum
     $ map
         (\(value, store') -> do
-          put store'
+          E.put store'
           return value
         )
     $ S.toList entries
@@ -533,93 +537,24 @@ mlfp bot f = loop bot
 
 {-- abstract monad stack --}
 
-{-
-
-type AbstractStack =
-  ReaderT AbstractEnv
-    (ReaderT (Roots History)
-      (ReaderT History
-        (ExceptT String
-          (WriterT [AbstractMachineState]
-            (StateT AbstractStore
-              (ListT
-                (ReaderT Cache
-                  (StateT Cache Identity))))))))
-
-newtype Abstract a = Abstract { runAbstract :: AbstractStack a }
-  deriving
-    ( Functor
-    , Applicative
-    , Monad
-    , MonadReader AbstractEnv
-    , MonadState AbstractStore
-    , MonadError String
-    , MonadWriter [AbstractMachineState])
-
-liftControl
-  :: (MonadTransControl t, Monad m, Monad (t m))
-  => (Run t -> m (StT t a))
-  -> t m a
-liftControl f = liftWith f >>= restoreT . return
-
--- We can't rely on GeneralizedNewtypeDeriving for the Alternative instance
--- because it would select the ExceptT instance instead of the ListT one.
-instance Alternative Abstract where
-  empty = Abstract . lift . lift . lift . lift . lift . lift $ empty
-  Abstract a <|> Abstract b = Abstract $
-    liftControl $ \run1 ->           -- peel ReaderT AbstractEnv
-      liftControl $ \run2 ->         -- peel ReaderT (Roots History)
-        liftControl $ \run3 ->       -- peel ReaderT History
-          liftControl $ \run4 ->     -- peel ExceptT String
-            liftControl $ \run5 ->   -- peel WriterT [AbstractMachineState]
-              liftControl $ \run6 -> -- peel StateT AbstractStore
-                let run = run6 . run5 . run4 . run3 . run2 . run1
-                in run a <|> run b
-
-instance MonadPlus Abstract
-
-instance MonadCache Abstract where
-  getCacheIn = Abstract . lift . lift . lift . lift . lift . lift . lift $ ask
-  withLocalCacheIn c (Abstract m) = Abstract $
-    liftControl $ \run1 ->
-      liftControl $ \run2 ->
-        liftControl $ \run3 ->
-          liftControl $ \run4 ->
-            liftControl $ \run5 ->
-              liftControl $ \run6 ->
-                liftControl $ \run7 ->
-              local (const c) (run7 . run6 . run5 . run4 . run3 . run2 . run1 $ m)
-  getCacheOut = Abstract . lift . lift . lift . lift . lift . lift . lift . lift $ get
-  putCacheOut c = Abstract . lift . lift . lift . lift . lift . lift . lift . lift $ put c
-
-instance MonadHistory Abstract where
-  localHistory f a = Abstract $
-     liftControl $ \run1 ->
-       liftControl $ \run2 ->
-         local f ((run2 . run1) (runAbstract a))
-
-instance MonadGarbage Abstract History where
-  askRoots = Abstract . lift $ ask
-  extraRoots roots a = Abstract $
-     liftControl $ \run ->
-       local (roots `S.union`) (run (runAbstract a))
-
-evalAbstract :: Int -> LExpr -> ([((Either String AbstractValue, [AbstractMachineState]), AbstractStore)], Cache)
+evalAbstract
+  :: Int
+  -> LExpr
+  -> (Cache,
+       [(AbstractStore,
+         ([AbstractMachineState], Either String AbstractValue))])
 evalAbstract limit e =
-  fixCache (fix (evCache (evHistory limit (evGc (evTell ev))))) e
-    & runAbstract
-    & flip runReaderT M.empty      -- environment
-    & flip runReaderT S.empty      -- garbage collection roots
-    & flip runReaderT (History []) -- history
-    & runExceptT                   -- errors
-    & runWriterT                   -- trace
-    & flip runStateT M.empty       -- store
-    & runListT                     -- non-determinism
-    & flip runReaderT M.empty      -- cache-in
-    & flip runStateT M.empty       -- cache-out
-    & runIdentity
-
--}
+  fixCache (fix (evCache (evHistory limit (evGc @_ @_ @History @_ @(S.Set AbstractValue) (evTell @_ @_ @History @_ @(S.Set AbstractValue) ev))))) e
+    & E.runReader (M.empty :: AbstractEnv)      -- environment
+    & E.runReader (S.empty :: Roots History)     -- garbage collection roots
+    & E.runReader (History []) -- history
+    & E.runError @String                  -- error
+    & E.runWriter @[AbstractMachineState]   -- trace
+    & E.runState (M.empty :: AbstractStore)      -- store
+    & E.runNonDet @[]                   -- non-determinism
+    & E.runReader (M.empty :: Cache)     -- cache-in
+    & E.runState (M.empty :: Cache)      -- cache-out
+    & E.run
 
 {- Example -}
 
@@ -648,9 +583,9 @@ main = do
   printHeader "-- CONCRETE TRACE --"
   pPrint $ evalCollect ltest
   printHeader "-- ABSTRACT 1 --"
-  --pPrint $ S.fromList $ fst $ evalAbstract 1 ltest
+  pPrint $ S.fromList $ snd $ evalAbstract 1 ltest
   printHeader "-- ABSTRACT 2 --"
-  --pPrint $ S.fromList $ fst $ evalAbstract 2 ltest
+  pPrint $ S.fromList $ snd $ evalAbstract 2 ltest
 
   where printHeader s = putStrLn ("\n" ++ s ++ "\n")
         ltest = label test
