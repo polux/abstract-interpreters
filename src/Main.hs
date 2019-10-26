@@ -30,6 +30,10 @@
 import qualified Control.Effect as E
 import qualified Control.Effect.Reader as E
 import qualified Control.Effect.State as E
+import qualified Control.Effect.Error as E
+import qualified Control.Effect.NonDet as E
+import qualified Control.Effect.Writer as E
+import Data.Foldable (asum)
 
 import Control.Applicative
 import Control.Monad.Except
@@ -129,11 +133,11 @@ type ConcreteEnv = Env Int
 data ConcreteValue = VInt Int | VClosure ConcreteEnv Name LExpr
   deriving (Eq, Ord, Show)
 
-instance MonadError String m => Value m Int ConcreteValue where
+instance (E.Member (E.Error String) sig, E.Carrier sig m) => Value m Int ConcreteValue where
   toInt i = return (VInt i)
 
   asClosure (VClosure env x e) = return (env, x, e)
-  asClosure v = throwError (show v ++ " is not a closure")
+  asClosure v = E.throwError (show v ++ " is not a closure")
 
   toClosure env x e = return (VClosure env x e)
 
@@ -145,7 +149,7 @@ instance MonadError String m => Value m Int ConcreteValue where
       Minus -> return (VInt (ai - bi))
       Times -> return (VInt (ai * bi))
       Div -> if bi == 0
-        then throwError "division by zero"
+        then E.throwError "division by zero"
         else return (VInt (ai `div` bi))
 
   isZero v = do
@@ -162,11 +166,11 @@ data AbstractInt = SomeInt | ExactInt Int
 data AbstractValue = AInt AbstractInt | AClosure AbstractEnv Name LExpr
   deriving (Eq, Ord, Show)
 
-instance (MonadError String m, MonadPlus m) => Value m History AbstractValue where
+instance (E.Member (E.Error String) sig, Alternative m, E.Carrier sig m) => Value m History AbstractValue where
   toInt i = return (AInt (ExactInt i))
 
   asClosure (AClosure env x e) = return (env, x, e)
-  asClosure v = throwError (show v ++ " is not a closure")
+  asClosure v = E.throwError (show v ++ " is not a closure")
 
   toClosure env x e = return (AClosure env x e)
 
@@ -179,15 +183,15 @@ instance (MonadError String m, MonadPlus m) => Value m History AbstractValue whe
   op2 Times (AInt (ExactInt i)) (AInt (ExactInt j)) = return (AInt (ExactInt (i*j)))
   op2 Times (AInt _) (AInt _) = return (AInt SomeInt)
 
-  op2 Div (AInt _) (AInt (ExactInt 0)) = throwError "division by zero"
+  op2 Div (AInt _) (AInt (ExactInt 0)) = E.throwError "division by zero"
   op2 Div (AInt (ExactInt i)) (AInt (ExactInt j)) = return (AInt (ExactInt (i `div` j)))
-  op2 Div (AInt _) (AInt _) = throwError "division by zero" `mplus` return (AInt SomeInt)
+  op2 Div (AInt _) (AInt _) = E.throwError "division by zero" <|> return (AInt SomeInt)
 
-  op2 op a b = throwError ("type error " ++ show (op, a, b))
+  op2 op a b = E.throwError ("type error " ++ show (op, a, b))
 
   isZero (AInt (ExactInt n)) = return (n == 0)
-  isZero (AInt SomeInt) = return True `mplus` return False
-  isZero x = throwError ("type error isZero: " ++ show x)
+  isZero (AInt SomeInt) = return True <|> return False
+  isZero x = E.throwError ("type error isZero: " ++ show x)
 
 {- Stores -}
 
@@ -202,20 +206,20 @@ type Store a v = M.Map a v
 
 type ConcreteStore = Store Int ConcreteValue
 
-asInt :: MonadError String m => ConcreteValue -> m Int
+asInt :: (E.Member (E.Error String) sig, E.Carrier sig m) => ConcreteValue -> m Int
 asInt (VInt i) = return i
-asInt v = throwError (show v ++ " is not an int")
+asInt v = E.throwError (show v ++ " is not an int")
 
-instance (MonadError String m, MonadState ConcreteStore m) => MonadStore m Int ConcreteValue where
+instance (E.Member (E.Error String) sig, E.Member (E.State ConcreteStore) sig, E.Carrier sig m) => MonadStore m Int ConcreteValue where
   find a = do
-    maybeVal <- gets (M.lookup a)
+    maybeVal <- E.gets (M.lookup a)
     case maybeVal of
       Just v -> return v
-      Nothing -> throwError ("unknown address " ++ show a)
+      Nothing -> E.throwError ("unknown address " ++ show a)
 
-  ext a v = modify (M.insert a v)
+  ext a v = E.modify (M.insert a v)
 
-  alloc _ = gets M.size
+  alloc _ = E.gets (M.size :: ConcreteStore -> Int)
 
 {-- abstract stores --}
 
@@ -227,24 +231,24 @@ instance Show History where
 
 type AbstractStore = Store History (S.Set AbstractValue)
 
-instance MonadStore Abstract History AbstractValue where
+instance (E.Member (E.Error String) sig, E.Member (E.Reader History) sig, E.Member (E.State AbstractStore) sig, Alternative m, E.Carrier sig m) => MonadStore m History AbstractValue where
   find a = do
-    maybeVals <- gets (M.lookup a)
+    maybeVals <- E.gets @AbstractStore (M.lookup a)
     case maybeVals of
-      Just vals -> msum (map return (S.toList vals))
-      Nothing -> throwError ("unknown address " ++ show a)
+      Just vals -> asum (map pure (S.toList vals))
+      Nothing -> E.throwError ("unknown address " ++ show a)
 
   ext a v = do
-    maybeVals <- gets (M.lookup a)
+    maybeVals <- E.gets (M.lookup a)
     let newVals = case maybeVals of
           Nothing -> S.singleton v
           Just vs -> S.insert (AInt SomeInt) (S.filter isAClosure vs)
-    modify (M.insert a newVals)
+    E.modify (M.insert a newVals)
    where
     isAClosure (AClosure _ _ _) = True
     isAClosure _ = False
 
-  alloc l = Abstract . lift . lift $ asks (cons l)
+  alloc l = E.asks @History (cons l)
     where cons l (History ls) = History (l:ls)
 
 {- Garbage Collection -}
@@ -289,11 +293,13 @@ gc addresses store = store `M.restrictKeys` reachable addresses addresses
     where as' = S.unions [ roots (store M.! a) | a <- S.toList as ]
 
 evGc
-  :: forall m a v av. ( MonadGarbage m a
-     , MonadState (M.Map a av) m
+  :: forall sig m a v av.
+     ( MonadGarbage m a
+     , E.Member (E.State (Store a av)) sig
      , Ord a
      , HasRoots v a
      , HasRoots av a
+     , E.Carrier sig m
      )
   => ((LExpr -> m v) -> LExpr -> m v)
   -> (LExpr -> m v)
@@ -302,123 +308,96 @@ evGc
 evGc ev0 ev e = do
   rs <- askRoots @m @a
   v <- ev0 ev e
-  modify (gc (S.union rs (roots v)))
+  E.modify @(Store a av) (gc (S.union rs (roots v)))
   return v
 
 {- Interpreter -}
 
 ev
-  :: forall m a v
-   . ( MonadError String m
-     , MonadReader (Env a) m
+  :: forall sig m a v
+   . ( E.Member (E.Error String) sig
+     , E.Member (E.Reader (Env a)) sig
      , MonadStore m a v
      , MonadGarbage m a
      , Value m a v
      , HasRoots v a
      , Ord a
+     , E.Carrier sig m
      )
   => (LExpr -> m v)
   -> LExpr
   -> m v
 ev ev e = ev' e
  where
+  ev' :: LExpr -> m v
   ev' (Lit i) = toInt i
   ev' (Op2 op a b) = do
-    env <- ask
+    env <- E.ask @(Env a)
     av <- extraRoots (exprRoots b env) (ev a)
     bv <- extraRoots (roots @v @a av) (ev b)
     op2 op av bv
   ev' (IfZero a b c) = do
-    env <- ask
+    env <- E.ask @(Env a)
     let newRooots = S.union (exprRoots b env) (exprRoots c env)
     av <- extraRoots newRooots (ev a)
     isZeroA <- isZero av
     ev (if isZeroA then b else c)
   ev' (Var x) = do
-    env <- ask
+    env <- E.ask
     find (env M.! x)
   ev' (Lam x e) = do
-    env <- ask
+    env <- E.ask
     toClosure env x e
   ev' (App _ a b) = do
-    env <- ask
+    env <- E.ask @(Env a)
     av <- extraRoots (exprRoots b env) (ev a)
     bv <- extraRoots (roots @v @a av) (ev b)
     (env, x@(Name l _), e) <- asClosure @m @a @v av
     addr <- alloc @m @a @v l
     ext addr bv
-    local (const (M.insert x addr env)) (ev e)
+    E.local (const (M.insert x addr env)) (ev e)
   ev' (Rec f@(Name l _) e) = do
-    env <- ask
+    env <- E.ask @(Env a)
     addr <- alloc @m @a @v l
-    ve <- local (M.insert f addr) (ev e)
+    ve <- E.local (M.insert f addr) (ev e)
     ext addr ve
     return ve
 
 {- Concrete semantics -}
 
-type ConcreteStack =
-  ReaderT ConcreteEnv
-    (ReaderT (Roots Int)
-      (ExceptT String
-        (StateT ConcreteStore Identity)))
+instance (E.Member (E.Reader (Roots Int)) sig, E.Carrier sig m) => MonadGarbage m Int where
+  askRoots = E.ask
+  extraRoots roots = E.local (roots `S.union`)
 
-newtype Concrete a = Concrete { runConcrete :: ConcreteStack a }
-  deriving
-    ( Functor
-    , Applicative
-    , Monad
-    , MonadReader ConcreteEnv
-    , MonadState ConcreteStore
-    , MonadError String)
-
-instance MonadGarbage Concrete Int where
-  askRoots = Concrete . lift $ ask
-  extraRoots roots a = Concrete $
-     liftControl $ \run ->
-       local (roots `S.union`) (run (runConcrete a))
-
-eval :: LExpr -> (Either String ConcreteValue, ConcreteStore)
+eval :: LExpr -> (ConcreteStore, Either String ConcreteValue)
 eval e =
-  fix (evGc ev) e
-    & runConcrete
-    & flip runReaderT M.empty  -- environment
-    & flip runReaderT S.empty  -- garbage collection roots
-    & runExceptT               -- errors
-    & flip runStateT M.empty   -- store
-    & runIdentity
+  fix (evGc @_ @_ @Int @_ @ConcreteValue ev) e
+    & E.runReader (M.empty :: ConcreteEnv)  -- environment
+    & E.runReader (S.empty :: Roots Int) -- garbage collection roots
+    & E.runError           -- error
+    & E.runState (M.empty :: ConcreteStore)   -- store
+    & E.run
 
 {- Trace semantics -}
 
-type TracingStack =
-  ReaderT ConcreteEnv
-    (ReaderT (Roots Int)
-      (ExceptT String
-        (StateT ConcreteStore
-          (WriterT [ConcreteMachineState] Identity))))
-
-newtype Tracing a = Tracing { runTracing :: TracingStack a }
-  deriving
-    ( Functor
-    , Applicative
-    , Monad
-    , MonadReader ConcreteEnv
-    , MonadState ConcreteStore
-    , MonadWriter [ConcreteMachineState]
-    , MonadError String)
-
-instance MonadGarbage Tracing Int where
-  askRoots = Tracing . lift $ ask
-  extraRoots roots a = Tracing $
-     liftControl $ \run ->
-       local (roots `S.union`) (run (runTracing a))
-
+evTell
+  :: forall sig m a v av.
+     ( MonadGarbage m a
+     , E.Member (E.State (Store a av)) sig
+     , E.Member (E.Reader (Env a)) sig
+     , E.Member (E.Writer [MachineState a v av]) sig
+     , E.Carrier sig m
+     )
+  => ((LExpr -> m v) -> LExpr -> m v)
+  -> (LExpr -> m v)
+  -> LExpr
+  -> m v
 evTell ev0 ev e = do
-  env <- ask
+  env <- E.ask @(Env a)
   roots <- askRoots
-  store <- get
+  store <- E.get @(Store a av)
   v <- ev0 ev e
-  tell [MachineState env roots store e v]
+  E.tell [MachineState env roots store e v]
   return v
 
 data MachineState a v av = MachineState
@@ -435,16 +414,16 @@ type AbstractMachineState = MachineState History AbstractValue (S.Set AbstractVa
 
 evalCollect
   :: LExpr
-  -> ((Either String ConcreteValue, ConcreteStore), [ConcreteMachineState])
+  -> ([ConcreteMachineState], (ConcreteStore, Either String ConcreteValue))
 evalCollect e =
-  fix (evGc (evTell ev)) e
-    & runTracing
-    & flip runReaderT M.empty  -- environment
-    & flip runReaderT S.empty  -- garbage collection roots
-    & runExceptT               -- errors
-    & flip runStateT M.empty   -- store
-    & runWriterT               -- collected states
-    & runIdentity
+  fix (evGc @_ @_ @Int @_ @ConcreteValue (evTell @_ @_ @Int @_ @ConcreteValue ev)) e
+  --fix (evTell @_ @_ @Int @_ @ConcreteValue ev) e
+    & E.runReader (M.empty :: ConcreteEnv)  -- environment
+    & E.runReader (S.empty :: Roots Int) -- garbage collection roots
+    & E.runError           -- error
+    & E.runState (M.empty :: ConcreteStore)   -- store
+    & E.runWriter
+    & E.run
 
 {- Abstract semantics -}
 
@@ -554,6 +533,8 @@ mlfp bot f = loop bot
 
 {-- abstract monad stack --}
 
+{-
+
 type AbstractStack =
   ReaderT AbstractEnv
     (ReaderT (Roots History)
@@ -638,6 +619,8 @@ evalAbstract limit e =
     & flip runStateT M.empty       -- cache-out
     & runIdentity
 
+-}
+
 {- Example -}
 
 instance IsString UExpr where
@@ -665,9 +648,9 @@ main = do
   printHeader "-- CONCRETE TRACE --"
   pPrint $ evalCollect ltest
   printHeader "-- ABSTRACT 1 --"
-  pPrint $ S.fromList $ fst $ evalAbstract 1 ltest
+  --pPrint $ S.fromList $ fst $ evalAbstract 1 ltest
   printHeader "-- ABSTRACT 2 --"
-  pPrint $ S.fromList $ fst $ evalAbstract 2 ltest
+  --pPrint $ S.fromList $ fst $ evalAbstract 2 ltest
 
   where printHeader s = putStrLn ("\n" ++ s ++ "\n")
         ltest = label test
