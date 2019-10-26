@@ -27,30 +27,18 @@
 -- limitations under the License.
 
 import Control.Applicative
-import qualified Control.Effect as E
-import qualified Control.Effect.Error as E
-import qualified Control.Effect.NonDet as E
-import qualified Control.Effect.Reader as E
-import qualified Control.Effect.State as E
-import qualified Control.Effect.Writer as E
-import Control.Monad.Except
-import Control.Monad.Identity
-import Control.Monad.List
-import Control.Monad.Reader
-import Control.Monad.State
-import Control.Monad.Trans
-import Control.Monad.Trans.Control
-import Control.Monad.Writer
+import Control.Effect
+import Control.Effect.Error
+import Control.Effect.NonDet
+import Control.Effect.Reader
+import Control.Effect.State
+import Control.Effect.Writer
 import Data.Foldable (asum)
 import Data.Function
-import Data.Functor.Classes
-import Data.Functor.Compose
 import Data.List (intercalate)
 import qualified Data.Map as M
 import Data.Maybe
 import qualified Data.Set as S
-import Data.Traversable
-import Debug.Trace
 import GHC.Exts (IsString (..))
 import Text.Show.Pretty (pPrint)
 
@@ -78,21 +66,21 @@ type LExpr = Expr Name Label
 
 label :: UExpr -> LExpr
 label e =
-  E.run
-    $ E.runReader
+  run
+    $ runReader
       (M.empty :: M.Map String Name)
-    $ E.evalState (0 :: Label) (label' e)
+    $ evalState (0 :: Label) (label' e)
   where
-    freshLabel = do l <- E.get; E.put (l + 1); return l
+    freshLabel = do l <- get; put (l + 1); return l
     freshName x = Name <$> freshLabel <*> pure x
-    label' (Var x) = Var <$> E.asks (M.! x)
+    label' (Var x) = Var <$> asks (M.! x)
     label' (App () e1 e2) = App <$> freshLabel <*> label' e1 <*> label' e2
     label' (Lam x e) = do
       name <- freshName x
-      Lam name <$> E.local (M.insert x name) (label' e)
+      Lam name <$> local (M.insert x name) (label' e)
     label' (Rec x e) = do
       name <- freshName x
-      Rec name <$> E.local (M.insert x name) (label' e)
+      Rec name <$> local (M.insert x name) (label' e)
     label' (IfZero e1 e2 e3) = IfZero <$> label' e1 <*> label' e2 <*> label' e3
     label' (Lit i) = return $ Lit i
     label' (Op2 op e1 e2) = Op2 op <$> label' e1 <*> label' e2
@@ -150,8 +138,8 @@ data ConcreteValue = VInt Int | VClosure ConcreteEnv Name LExpr
   deriving (Eq, Ord, Show)
 
 instance
-  ( E.Member (E.Error String) sig,
-    E.Carrier sig m
+  ( Member (Error String) sig,
+    Carrier sig m
   ) =>
   Value m Int ConcreteValue
   where
@@ -159,7 +147,7 @@ instance
   toInt i = return (VInt i)
 
   asClosure (VClosure env x e) = return (env, x, e)
-  asClosure v = E.throwError (show v ++ " is not a closure")
+  asClosure v = throwError (show v ++ " is not a closure")
 
   toClosure env x e = return (VClosure env x e)
 
@@ -172,7 +160,7 @@ instance
       Times -> return (VInt (ai * bi))
       Div ->
         if bi == 0
-          then E.throwError "division by zero"
+          then throwError "division by zero"
           else return (VInt (ai `div` bi))
 
   isZero v = do
@@ -190,9 +178,9 @@ data AbstractValue = AInt AbstractInt | AClosure AbstractEnv Name LExpr
   deriving (Eq, Ord, Show)
 
 instance
-  ( E.Member (E.Error String) sig,
-    Alternative m,
-    E.Carrier sig m
+  ( Member (Error String) sig,
+    Carrier sig m,
+    Alternative m
   ) =>
   Value m History AbstractValue
   where
@@ -200,7 +188,7 @@ instance
   toInt i = return (AInt (ExactInt i))
 
   asClosure (AClosure env x e) = return (env, x, e)
-  asClosure v = E.throwError (show v ++ " is not a closure")
+  asClosure v = throwError (show v ++ " is not a closure")
 
   toClosure env x e = return (AClosure env x e)
 
@@ -210,14 +198,14 @@ instance
   op2 Minus (AInt _) (AInt _) = return (AInt SomeInt)
   op2 Times (AInt (ExactInt i)) (AInt (ExactInt j)) = return (AInt (ExactInt (i * j)))
   op2 Times (AInt _) (AInt _) = return (AInt SomeInt)
-  op2 Div (AInt _) (AInt (ExactInt 0)) = E.throwError "division by zero"
+  op2 Div (AInt _) (AInt (ExactInt 0)) = throwError "division by zero"
   op2 Div (AInt (ExactInt i)) (AInt (ExactInt j)) = return (AInt (ExactInt (i `div` j)))
-  op2 Div (AInt _) (AInt _) = E.throwError "division by zero" <|> return (AInt SomeInt)
-  op2 op a b = E.throwError ("type error " ++ show (op, a, b))
+  op2 Div (AInt _) (AInt _) = throwError "division by zero" <|> return (AInt SomeInt)
+  op2 op a b = throwError ("type error " ++ show (op, a, b))
 
   isZero (AInt (ExactInt n)) = return (n == 0)
   isZero (AInt SomeInt) = return True <|> return False
-  isZero x = E.throwError ("type error isZero: " ++ show x)
+  isZero x = throwError ("type error isZero: " ++ show x)
 
 {- Stores -}
 
@@ -236,31 +224,31 @@ type Store a v = M.Map a v
 type ConcreteStore = Store Int ConcreteValue
 
 asInt ::
-  ( E.Member (E.Error String) sig,
-    E.Carrier sig m
+  ( Member (Error String) sig,
+    Carrier sig m
   ) =>
   ConcreteValue ->
   m Int
 asInt (VInt i) = return i
-asInt v = E.throwError (show v ++ " is not an int")
+asInt v = throwError (show v ++ " is not an int")
 
 instance
-  ( E.Member (E.Error String) sig,
-    E.Member (E.State ConcreteStore) sig,
-    E.Carrier sig m
+  ( Member (Error String) sig,
+    Member (State ConcreteStore) sig,
+    Carrier sig m
   ) =>
   MonadStore m Int ConcreteValue
   where
 
   find a = do
-    maybeVal <- E.gets (M.lookup a)
+    maybeVal <- gets (M.lookup a)
     case maybeVal of
       Just v -> return v
-      Nothing -> E.throwError ("unknown address " ++ show a)
+      Nothing -> throwError ("unknown address " ++ show a)
 
-  ext a v = E.modify (M.insert a v)
+  ext a v = modify (M.insert a v)
 
-  alloc _ = E.gets (M.size :: ConcreteStore -> Int)
+  alloc _ = gets (M.size :: ConcreteStore -> Int)
 
 {-- abstract stores --}
 
@@ -273,32 +261,32 @@ instance Show History where
 type AbstractStore = Store History (S.Set AbstractValue)
 
 instance
-  ( E.Member (E.Error String) sig,
-    E.Member (E.Reader History) sig,
-    E.Member (E.State AbstractStore) sig,
-    Alternative m,
-    E.Carrier sig m
+  ( Member (Error String) sig,
+    Member (Reader History) sig,
+    Member (State AbstractStore) sig,
+    Carrier sig m,
+    Alternative m
   ) =>
   MonadStore m History AbstractValue
   where
 
   find a = do
-    maybeVals <- E.gets @AbstractStore (M.lookup a)
+    maybeVals <- gets @AbstractStore (M.lookup a)
     case maybeVals of
       Just vals -> asum (map pure (S.toList vals))
-      Nothing -> E.throwError ("unknown address " ++ show a)
+      Nothing -> throwError ("unknown address " ++ show a)
 
   ext a v = do
-    maybeVals <- E.gets (M.lookup a)
+    maybeVals <- gets (M.lookup a)
     let newVals = case maybeVals of
           Nothing -> S.singleton v
           Just vs -> S.insert (AInt SomeInt) (S.filter isAClosure vs)
-    E.modify (M.insert a newVals)
+    modify (M.insert a newVals)
     where
       isAClosure (AClosure _ _ _) = True
       isAClosure _ = False
 
-  alloc l = E.asks @History (cons l)
+  alloc l = asks @History (cons l)
     where
       cons l (History ls) = History (l : ls)
 
@@ -307,21 +295,21 @@ instance
 type Roots a = S.Set a
 
 askRoots ::
-  ( E.Member (E.Reader (Roots a)) sig,
-    E.Carrier sig m
+  ( Member (Reader (Roots a)) sig,
+    Carrier sig m
   ) =>
   m (Roots a)
-askRoots = E.ask
+askRoots = ask
 
 extraRoots ::
-  ( E.Member (E.Reader (Roots a)) sig,
-    Ord a,
-    E.Carrier sig m
+  ( Member (Reader (Roots a)) sig,
+    Carrier sig m,
+    Ord a
   ) =>
   Roots a ->
   m b ->
   m b
-extraRoots roots = E.local (roots `S.union`)
+extraRoots roots = local (roots `S.union`)
 
 fv :: Ord n => Expr n l -> S.Set n
 fv (Lit _) = S.empty
@@ -360,12 +348,12 @@ gc addresses store = store `M.restrictKeys` reachable addresses addresses
 
 evGc ::
   forall sig m a v av.
-  ( E.Member (E.Reader (Roots a)) sig,
-    E.Member (E.State (Store a av)) sig,
+  ( Member (Reader (Roots a)) sig,
+    Member (State (Store a av)) sig,
+    Carrier sig m,
     Ord a,
     HasRoots v a,
-    HasRoots av a,
-    E.Carrier sig m
+    HasRoots av a
   ) =>
   ((LExpr -> m v) -> LExpr -> m v) ->
   (LExpr -> m v) ->
@@ -374,21 +362,21 @@ evGc ::
 evGc ev0 ev e = do
   rs <- askRoots
   v <- ev0 ev e
-  E.modify @(Store a av) (gc (S.union rs (roots v)))
+  modify @(Store a av) (gc (S.union rs (roots v)))
   return v
 
 {- Interpreter -}
 
 ev ::
   forall sig m a v.
-  ( E.Member (E.Error String) sig,
-    E.Member (E.Reader (Env a)) sig,
-    E.Member (E.Reader (Roots a)) sig,
+  ( Member (Error String) sig,
+    Member (Reader (Env a)) sig,
+    Member (Reader (Roots a)) sig,
+    Carrier sig m,
     MonadStore m a v,
     Value m a v,
     HasRoots v a,
-    Ord a,
-    E.Carrier sig m
+    Ord a
   ) =>
   (LExpr -> m v) ->
   LExpr ->
@@ -398,34 +386,34 @@ ev ev e = ev' e
     ev' :: LExpr -> m v
     ev' (Lit i) = toInt i
     ev' (Op2 op a b) = do
-      env <- E.ask @(Env a)
+      env <- ask @(Env a)
       av <- extraRoots (exprRoots b env) (ev a)
       bv <- extraRoots (roots @v @a av) (ev b)
       op2 op av bv
     ev' (IfZero a b c) = do
-      env <- E.ask @(Env a)
+      env <- ask @(Env a)
       let newRooots = S.union (exprRoots b env) (exprRoots c env)
       av <- extraRoots newRooots (ev a)
       isZeroA <- isZero av
       ev (if isZeroA then b else c)
     ev' (Var x) = do
-      env <- E.ask
+      env <- ask
       find (env M.! x)
     ev' (Lam x e) = do
-      env <- E.ask
+      env <- ask
       toClosure env x e
     ev' (App _ a b) = do
-      env <- E.ask @(Env a)
+      env <- ask @(Env a)
       av <- extraRoots (exprRoots b env) (ev a)
       bv <- extraRoots (roots @v @a av) (ev b)
       (env, x@(Name l _), e) <- asClosure @m @a @v av
       addr <- alloc @m @a @v l
       ext addr bv
-      E.local (const (M.insert x addr env)) (ev e)
+      local (const (M.insert x addr env)) (ev e)
     ev' (Rec f@(Name l _) e) = do
-      env <- E.ask @(Env a)
+      env <- ask @(Env a)
       addr <- alloc @m @a @v l
-      ve <- E.local (M.insert f addr) (ev e)
+      ve <- local (M.insert f addr) (ev e)
       ext addr ve
       return ve
 
@@ -434,32 +422,32 @@ ev ev e = ev' e
 eval :: LExpr -> (ConcreteStore, Either String ConcreteValue)
 eval e =
   fix (evGc @_ @_ @Int @_ @ConcreteValue ev) e
-    & E.runReader (M.empty :: ConcreteEnv) -- environment
-    & E.runReader (S.empty :: Roots Int) -- garbage collection roots
-    & E.runError -- error
-    & E.runState (M.empty :: ConcreteStore) -- store
-    & E.run
+    & runReader (M.empty :: ConcreteEnv) -- environment
+    & runReader (S.empty :: Roots Int) -- garbage collection roots
+    & runError -- error
+    & runState (M.empty :: ConcreteStore) -- store
+    & run
 
 {- Trace semantics -}
 
 evTell ::
   forall sig m a v av.
-  ( E.Member (E.Reader (Roots a)) sig,
-    E.Member (E.State (Store a av)) sig,
-    E.Member (E.Reader (Env a)) sig,
-    E.Member (E.Writer [MachineState a v av]) sig,
-    E.Carrier sig m
+  ( Member (Reader (Roots a)) sig,
+    Member (State (Store a av)) sig,
+    Member (Reader (Env a)) sig,
+    Member (Writer [MachineState a v av]) sig,
+    Carrier sig m
   ) =>
   ((LExpr -> m v) -> LExpr -> m v) ->
   (LExpr -> m v) ->
   LExpr ->
   m v
 evTell ev0 ev e = do
-  env <- E.ask @(Env a)
+  env <- ask @(Env a)
   roots <- askRoots
-  store <- E.get @(Store a av)
+  store <- get @(Store a av)
   v <- ev0 ev e
-  E.tell [MachineState env roots store e v]
+  tell [MachineState env roots store e v]
   return v
 
 data MachineState a v av
@@ -485,29 +473,29 @@ evalCollect e =
         (evTell @_ @_ @Int @_ @ConcreteValue ev)
     )
     e
-    & E.runReader (M.empty :: ConcreteEnv) -- environment
-    & E.runReader (S.empty :: Roots Int) -- garbage collection roots
-    & E.runError -- error
-    & E.runState (M.empty :: ConcreteStore) -- store
-    & E.runWriter
-    & E.run
+    & runReader (M.empty :: ConcreteEnv) -- environment
+    & runReader (S.empty :: Roots Int) -- garbage collection roots
+    & runError -- error
+    & runState (M.empty :: ConcreteStore) -- store
+    & runWriter
+    & run
 
 {- Abstract semantics -}
 
 {-- history --}
 
 localHistory ::
-  ( E.Member (E.Reader History) sig,
-    E.Carrier sig m
+  ( Member (Reader History) sig,
+    Carrier sig m
   ) =>
   (History -> History) ->
   m a ->
   m a
-localHistory = E.local @History
+localHistory = local @History
 
 evHistory ::
-  ( E.Member (E.Reader History) sig,
-    E.Carrier sig m
+  ( Member (Reader History) sig,
+    Carrier sig m
   ) =>
   Int ->
   ((LExpr -> m v) -> LExpr -> m v) ->
@@ -530,29 +518,29 @@ type ValueAndStore = (AbstractValue, AbstractStore)
 
 type Cache = M.Map Configuration (S.Set ValueAndStore)
 
-getCacheIn :: (E.Member (E.Reader Cache) sig, E.Carrier sig m) => m Cache
-getCacheIn = E.ask
+getCacheIn :: (Member (Reader Cache) sig, Carrier sig m) => m Cache
+getCacheIn = ask
 
-withLocalCacheIn :: (E.Member (E.Reader Cache) sig, E.Carrier sig m) => Cache -> m a -> m a
-withLocalCacheIn cache = E.local (const cache)
+withLocalCacheIn :: (Member (Reader Cache) sig, Carrier sig m) => Cache -> m a -> m a
+withLocalCacheIn cache = local (const cache)
 
-getCacheOut :: (E.Member (E.State Cache) sig, E.Carrier sig m) => m Cache
-getCacheOut = E.get
+getCacheOut :: (Member (State Cache) sig, Carrier sig m) => m Cache
+getCacheOut = get
 
-putCacheOut :: (E.Member (E.State Cache) sig, E.Carrier sig m) => Cache -> m ()
-putCacheOut = E.put
+putCacheOut :: (Member (State Cache) sig, Carrier sig m) => Cache -> m ()
+putCacheOut = put
 
 modifyCacheOut f = do
   cache <- getCacheOut
   putCacheOut (f cache)
 
 evCache ::
-  ( E.Member (E.Reader AbstractEnv) sig,
-    E.Member (E.State AbstractStore) sig,
-    E.Member (E.Reader (Roots History)) sig,
-    E.Member (E.Reader Cache) sig,
-    E.Member (E.State Cache) sig,
-    E.Carrier sig m,
+  ( Member (Reader AbstractEnv) sig,
+    Member (State AbstractStore) sig,
+    Member (Reader (Roots History)) sig,
+    Member (Reader Cache) sig,
+    Member (State Cache) sig,
+    Carrier sig m,
     Alternative m
   ) =>
   ((LExpr -> m AbstractValue) -> LExpr -> m AbstractValue) ->
@@ -560,52 +548,52 @@ evCache ::
   LExpr ->
   m AbstractValue
 evCache ev0 ev e = do
-  env <- E.ask
+  env <- ask
   roots <- askRoots
-  store <- E.get
+  store <- get
   let config = (e, env, roots, store)
   cacheOut <- getCacheOut
   case M.lookup config cacheOut of
     Just entries -> do
       (configIn, storeIn) <- asum (map return (S.toList entries))
-      E.put storeIn
+      put storeIn
       return configIn
     Nothing -> do
       cacheIn <- getCacheIn
       let entries = fromMaybe S.empty (M.lookup config cacheIn)
       putCacheOut (M.insertWith S.union config entries cacheOut)
       v <- ev0 ev e
-      store' <- E.get
+      store' <- get
       modifyCacheOut (M.insertWith S.union config (S.singleton (v, store')))
       return v
 
 fixCache ::
-  ( E.Member (E.Reader AbstractEnv) sig,
-    E.Member (E.State AbstractStore) sig,
-    E.Member (E.Reader (Roots History)) sig,
-    E.Member (E.Reader Cache) sig,
-    E.Member (E.State Cache) sig,
-    E.Carrier sig m,
+  ( Member (Reader AbstractEnv) sig,
+    Member (State AbstractStore) sig,
+    Member (Reader (Roots History)) sig,
+    Member (Reader Cache) sig,
+    Member (State Cache) sig,
+    Carrier sig m,
     Alternative m
   ) =>
   (LExpr -> m AbstractValue) ->
   LExpr ->
   m AbstractValue
 fixCache ev e = do
-  env <- E.ask
+  env <- ask
   roots <- askRoots
-  store <- E.get
+  store <- get
   let config = (e, env, roots, store)
   cachePlus <- mlfp M.empty $ \cache -> do
     putCacheOut M.empty
-    E.put store
+    put store
     withLocalCacheIn cache (ev e)
     getCacheOut
   let entries = cachePlus M.! config
   asum
     $ map
       ( \(value, store') -> do
-          E.put store'
+          put store'
           return value
       )
     $ S.toList entries
@@ -629,16 +617,16 @@ evalAbstract ::
   )
 evalAbstract limit e =
   fixCache (fix (evCache (evHistory limit (evGc @_ @_ @History @_ @(S.Set AbstractValue) (evTell @_ @_ @History @_ @(S.Set AbstractValue) ev))))) e
-    & E.runReader (M.empty :: AbstractEnv) -- environment
-    & E.runReader (S.empty :: Roots History) -- garbage collection roots
-    & E.runReader (History []) -- history
-    & E.runError @String -- error
-    & E.runWriter @[AbstractMachineState] -- trace
-    & E.runState (M.empty :: AbstractStore) -- store
-    & E.runNonDet @[] -- non-determinism
-    & E.runReader (M.empty :: Cache) -- cache-in
-    & E.runState (M.empty :: Cache) -- cache-out
-    & E.run
+    & runReader (M.empty :: AbstractEnv) -- environment
+    & runReader (S.empty :: Roots History) -- garbage collection roots
+    & runReader (History []) -- history
+    & runError @String -- error
+    & runWriter @[AbstractMachineState] -- trace
+    & runState (M.empty :: AbstractStore) -- store
+    & runNonDet @[] -- non-determinism
+    & runReader (M.empty :: Cache) -- cache-in
+    & runState (M.empty :: Cache) -- cache-out
+    & run
 
 {- Example -}
 
