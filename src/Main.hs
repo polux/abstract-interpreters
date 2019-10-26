@@ -39,6 +39,8 @@ import Data.List (intercalate)
 import qualified Data.Map as M
 import Data.Maybe
 import qualified Data.Set as S
+import qualified Data.Set.Monad as SM
+import Debug.Trace
 import GHC.Exts (IsString (..))
 import Text.Show.Pretty (pPrint)
 
@@ -610,10 +612,11 @@ evalAbstract ::
   Int ->
   LExpr ->
   ( Cache,
-    [ ( AbstractStore,
-        ([AbstractMachineState], Either String AbstractValue)
+    SM.Set
+      ( ( AbstractStore,
+          ([AbstractMachineState], Either String AbstractValue)
+        )
       )
-    ]
   )
 evalAbstract limit e =
   eval e
@@ -623,7 +626,7 @@ evalAbstract limit e =
     & runError @String -- error
     & runWriter @[AbstractMachineState] -- trace
     & runState (M.empty :: AbstractStore) -- store
-    & runNonDet @[] -- non-determinism
+    & runNonDet @SM.Set -- non-determinism
     & runReader (M.empty :: Cache) -- cache-in
     & runState (M.empty :: Cache) -- cache-out
     & run
@@ -631,6 +634,7 @@ evalAbstract limit e =
     eval =
       ev
         & evTell @_ @_ @History @_ @(S.Set AbstractValue)
+        & evGc @_ @_ @History @_ @(S.Set AbstractValue)
         & evHistory limit
         & evCache
         & fix
@@ -653,6 +657,19 @@ a /: b = Op2 Div a b
 
 letIn x e1 e2 = Lam x e2 @: e1
 
+fiblike :: UExpr
+fiblike =
+  Rec
+    "fib"
+    ( Lam
+        "n"
+        ( IfZero
+            "n"
+            (Lit 1)
+            (("fib" @: ("n" -: Lit 1)) +: ("fib" @: ("n" -: Lit 1)))
+        )
+    )
+
 fact :: UExpr
 fact =
   Rec "fact" (Lam "n" (IfZero "n" (Lit 1) ("n" *: ("fact" @: ("n" -: Lit 1)))))
@@ -669,9 +686,9 @@ main = do
   printHeader "-- CONCRETE TRACE --"
   pPrint $ evalCollect ltest
   printHeader "-- ABSTRACT 1 --"
-  pPrint $ S.fromList $ snd $ evalAbstract 1 ltest
+  pPrint $ snd $ evalAbstract 1 ltest
   printHeader "-- ABSTRACT 2 --"
-  pPrint $ S.fromList $ snd $ evalAbstract 2 ltest
+  pPrint $ snd $ evalAbstract 2 ltest
   where
     printHeader s = putStrLn ("\n" ++ s ++ "\n")
     ltest = label test

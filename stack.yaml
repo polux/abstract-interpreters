@@ -15,4 +15,5 @@
 resolver: nightly-2019-09-16
 packages:
 - .
-extra-deps: []
+extra-deps:
+        - set-monad-0.3.0.0@sha256:4b6e63bf9aa80b0d64c078ce17aaf12b17f89cba581a98fdaa98efc824f93450,4051

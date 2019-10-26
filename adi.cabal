@@ -23,8 +23,7 @@ executable adi
   default-language:    Haskell2010
   build-depends:       base >= 4.7 && < 5,
                        containers,
-                       mtl,
-                       logict,
                        pretty-show,
-                       monad-control,
-                       fused-effects
+                       fused-effects,
+                       set-monad
+ ghc-options: -O2
